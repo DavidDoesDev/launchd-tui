@@ -209,7 +209,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// viewport sits inside the right pane: -2 for pane padding,
 		// -2 for the tab bar + its blank line.
 		m.vp = viewport.New(rightW-2, contentHeight-2)
-		m.vp.SetContent(m.logContent)
+		m.vp.SetContent(styleLog(m.logContent))
 		if m.autoScroll {
 			m.vp.GotoBottom()
 		}
@@ -227,6 +227,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pollMsg:
 		cmds = append(cmds, fetchAllStates(m.agents), pollCmd())
 
+	case tea.MouseMsg:
+		// Wheel-scroll the log viewport; re-sync auto-scroll to whether we
+		// ended up at the bottom.
+		if m.activeTab == tabLogs {
+			var cmd tea.Cmd
+			m.vp, cmd = m.vp.Update(msg)
+			cmds = append(cmds, cmd)
+			m.autoScroll = m.vp.AtBottom()
+		}
+
 	case tailMsg:
 		if msg.generation != m.tailGen {
 			return m, nil // stale loop — discard
@@ -234,7 +244,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.content != "" {
 			m.logOffset += int64(len(msg.content))
 			m.logContent += msg.content
-			m.vp.SetContent(m.logContent)
+			m.vp.SetContent(styleLog(m.logContent))
 			if m.autoScroll {
 				m.vp.GotoBottom()
 			}
