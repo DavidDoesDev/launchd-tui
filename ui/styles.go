@@ -15,4 +15,12 @@ var (
 			Background(lipgloss.Color("235")).
 			Foreground(lipgloss.Color("245")).
 			Padding(0, 1)
+
+	rowStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("250"))
+
+	selectedRowStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255")).
+				Background(lipgloss.Color("237")).
+				Bold(true)
 )
