@@ -2,46 +2,106 @@ package ui
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/DavidDoesDev/launchd-tui/config"
 	"github.com/DavidDoesDev/launchd-tui/launchd"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const pollInterval = 2 * time.Second
+const logTailInterval = 500 * time.Millisecond
+const pulseInterval = 800 * time.Millisecond
+
+const (
+	tabLogs = 0
+	tabInfo = 1
+)
+
+// --- message types ---
 
 type pollMsg struct{}
 
+type tailMsg struct {
+	content    string
+	generation int
+}
+
+type pulseMsg struct{}
+
+type actionDoneMsg struct {
+	idx        int
+	prevStatus launchd.Status
+}
+
+type actionPollMsg struct {
+	idx        int
+	prevStatus launchd.Status
+}
+
+type singleStateMsg struct {
+	idx   int
+	state launchd.AgentState
+}
+
+// --- model ---
+
 type Model struct {
-	width   int
-	height  int
-	agents  []config.Agent
-	states  []launchd.AgentState
-	cursor  int
-	loadErr error
+	width          int
+	height         int
+	agents         []config.Agent
+	states         []launchd.AgentState
+	cursor         int
+	loadErr        error
+	activeTab      int
+	spinner        spinner.Model
+	actionIdx      int
+	actionDeadline time.Time
+	pulsePhase     bool
+	vp             viewport.Model
+	logContent     string
+	autoScroll     bool
+	logPath        string
+	logOffset      int64
+	tailGen        int
 }
 
 func New() Model {
 	cfg, err := config.Load()
-	m := Model{
-		agents:  cfg.Agents,
-		states:  make([]launchd.AgentState, len(cfg.Agents)),
-		loadErr: err,
+	sp := spinner.New(
+		spinner.WithSpinner(spinner.MiniDot),
+		spinner.WithStyle(spinnerStyle),
+	)
+	return Model{
+		agents:     cfg.Agents,
+		states:     make([]launchd.AgentState, len(cfg.Agents)),
+		loadErr:    err,
+		activeTab:  tabLogs,
+		autoScroll: true,
+		spinner:    sp,
+		actionIdx:  -1,
 	}
-	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchAllStates(m.agents), pollCmd())
+	return tea.Batch(fetchAllStates(m.agents), pollCmd(), pulseCmd())
 }
 
+func pulseCmd() tea.Cmd {
+	return tea.Tick(pulseInterval, func(time.Time) tea.Msg { return pulseMsg{} })
+}
+
+// --- commands ---
+
 func pollCmd() tea.Cmd {
-	return tea.Tick(pollInterval, func(time.Time) tea.Msg {
-		return pollMsg{}
-	})
+	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollMsg{} })
 }
 
 func fetchAllStates(agents []config.Agent) tea.Cmd {
@@ -54,33 +114,256 @@ func fetchAllStates(agents []config.Agent) tea.Cmd {
 	}
 }
 
+func fetchOneState(agents []config.Agent, idx int) tea.Cmd {
+	return func() tea.Msg {
+		return singleStateMsg{idx: idx, state: launchd.GetState(agents[idx].Label)}
+	}
+}
+
+func startCmd(label string, idx int, prev launchd.Status) tea.Cmd {
+	return func() tea.Msg {
+		launchd.Start(label) //nolint:errcheck
+		return actionDoneMsg{idx: idx, prevStatus: prev}
+	}
+}
+
+func stopCmd(label string, idx int, prev launchd.Status) tea.Cmd {
+	return func() tea.Msg {
+		launchd.Stop(label) //nolint:errcheck
+		return actionDoneMsg{idx: idx, prevStatus: prev}
+	}
+}
+
+func restartCmd(label string, idx int, prev launchd.Status) tea.Cmd {
+	return func() tea.Msg {
+		launchd.Stop(label)  //nolint:errcheck
+		launchd.Start(label) //nolint:errcheck
+		return actionDoneMsg{idx: idx, prevStatus: prev}
+	}
+}
+
+func actionPollCmd(idx int, prev launchd.Status) tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg {
+		return actionPollMsg{idx: idx, prevStatus: prev}
+	})
+}
+
+func tailCmd(path string, offset int64, gen int) tea.Cmd {
+	return tea.Tick(logTailInterval, func(time.Time) tea.Msg {
+		if path == "" {
+			return tailMsg{generation: gen}
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return tailMsg{generation: gen}
+		}
+		defer f.Close()
+		if offset > 0 {
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				return tailMsg{generation: gen}
+			}
+		}
+		b, err := io.ReadAll(f)
+		if err != nil || len(b) == 0 {
+			return tailMsg{generation: gen}
+		}
+		return tailMsg{content: string(b), generation: gen}
+	})
+}
+
+func resolveLogPath(label string) string {
+	stdout, stderr, err := launchd.LogPaths(label)
+	if err != nil {
+		return ""
+	}
+	if stdout != "" {
+		return stdout
+	}
+	return stderr
+}
+
+func (m *Model) startTail() tea.Cmd {
+	if m.activeTab != tabLogs || len(m.agents) == 0 || m.cursor >= len(m.agents) {
+		return nil
+	}
+	path := resolveLogPath(m.agents[m.cursor].Label)
+	m.tailGen++
+	m.logPath = path
+	m.logOffset = 0
+	m.logContent = ""
+	m.autoScroll = true
+	m.vp.SetContent("")
+	return tailCmd(path, 0, m.tailGen)
+}
+
+// --- update ---
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		_, rightW, contentHeight := m.layout()
+		// viewport sits inside the right pane: -2 for pane padding,
+		// -2 for the tab bar + its blank line.
+		m.vp = viewport.New(rightW-2, contentHeight-2)
+		m.vp.SetContent(m.logContent)
+		if m.autoScroll {
+			m.vp.GotoBottom()
+		}
+		if cmd := m.startTail(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 
 	case []launchd.AgentState:
 		m.states = msg
 
+	case pulseMsg:
+		m.pulsePhase = !m.pulsePhase
+		cmds = append(cmds, pulseCmd())
+
 	case pollMsg:
-		return m, tea.Batch(fetchAllStates(m.agents), pollCmd())
+		cmds = append(cmds, fetchAllStates(m.agents), pollCmd())
+
+	case tailMsg:
+		if msg.generation != m.tailGen {
+			return m, nil // stale loop — discard
+		}
+		if msg.content != "" {
+			m.logOffset += int64(len(msg.content))
+			m.logContent += msg.content
+			m.vp.SetContent(m.logContent)
+			if m.autoScroll {
+				m.vp.GotoBottom()
+			}
+		}
+		cmds = append(cmds, tailCmd(m.logPath, m.logOffset, m.tailGen))
+
+	case singleStateMsg:
+		if msg.idx < len(m.states) {
+			m.states[msg.idx] = msg.state
+		}
+
+	case actionDoneMsg:
+		return m, tea.Batch(fetchOneState(m.agents, msg.idx), actionPollCmd(msg.idx, msg.prevStatus))
+
+	case actionPollMsg:
+		statusChanged := msg.idx < len(m.states) && m.states[msg.idx].Status != msg.prevStatus
+		if statusChanged || time.Now().After(m.actionDeadline) {
+			m.actionIdx = -1
+			return m, nil
+		}
+		return m, tea.Batch(fetchOneState(m.agents, msg.idx), actionPollCmd(msg.idx, msg.prevStatus))
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
+				if cmd := m.startTail(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
 			}
+
 		case "down", "j":
 			if m.cursor < len(m.agents)-1 {
 				m.cursor++
+				if cmd := m.startTail(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+
+		case "pgup", "ctrl+u":
+			if m.activeTab == tabLogs {
+				var cmd tea.Cmd
+				m.vp, cmd = m.vp.Update(msg)
+				cmds = append(cmds, cmd)
+				m.autoScroll = false
+			}
+
+		case "pgdown", "ctrl+d", "G":
+			if m.activeTab == tabLogs {
+				var cmd tea.Cmd
+				m.vp, cmd = m.vp.Update(msg)
+				cmds = append(cmds, cmd)
+				if m.vp.AtBottom() {
+					m.autoScroll = true
+				}
+			}
+
+		case "tab":
+			m.activeTab = (m.activeTab + 1) % 2
+			if m.activeTab == tabLogs {
+				if cmd := m.startTail(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+
+		case "s":
+			if len(m.agents) > 0 && m.actionIdx == -1 {
+				idx := m.cursor
+				prev := launchd.StatusUnknown
+				if idx < len(m.states) {
+					prev = m.states[idx].Status
+				}
+				m.actionIdx = idx
+				m.actionDeadline = time.Now().Add(3 * time.Second)
+				return m, tea.Batch(startCmd(m.agents[idx].Label, idx, prev), m.spinner.Tick)
+			}
+
+		case "x":
+			if len(m.agents) > 0 && m.actionIdx == -1 {
+				idx := m.cursor
+				prev := launchd.StatusUnknown
+				if idx < len(m.states) {
+					prev = m.states[idx].Status
+				}
+				m.actionIdx = idx
+				m.actionDeadline = time.Now().Add(3 * time.Second)
+				return m, tea.Batch(stopCmd(m.agents[idx].Label, idx, prev), m.spinner.Tick)
+			}
+
+		case "r":
+			if len(m.agents) > 0 && m.actionIdx == -1 {
+				idx := m.cursor
+				prev := launchd.StatusUnknown
+				if idx < len(m.states) {
+					prev = m.states[idx].Status
+				}
+				m.actionIdx = idx
+				m.actionDeadline = time.Now().Add(3 * time.Second)
+				return m, tea.Batch(restartCmd(m.agents[idx].Label, idx, prev), m.spinner.Tick)
 			}
 		}
 	}
-	return m, nil
+
+	return m, tea.Batch(cmds...)
+}
+
+// --- view ---
+
+// layout computes pane widths and content height.
+// A pane's total on-screen width is its Width() + 2 (rounded border, no margin).
+// So leftW + rightW + 4 = m.width. Content height excludes the bottom bar (1)
+// and the pane's top/bottom border (2).
+func (m Model) layout() (leftW, rightW, contentHeight int) {
+	leftW = m.width*30/100 - 2
+	if leftW < 10 {
+		leftW = 10
+	}
+	rightW = m.width - leftW - 4
+	contentHeight = m.height - 1 - 2
+	return
 }
 
 func (m Model) View() string {
@@ -88,29 +371,30 @@ func (m Model) View() string {
 		return ""
 	}
 
-	barHeight := 1
-	panesHeight := m.height - barHeight
-	leftWidth := m.width*30/100 - 2
-	rightWidth := m.width - (leftWidth + 2) - 2
-	contentHeight := panesHeight - 2
+	leftW, rightW, contentHeight := m.layout()
 
 	left := leftPaneStyle.
-		Width(leftWidth).
+		Width(leftW).
 		Height(contentHeight).
-		Render(m.renderList(leftWidth))
+		Render(m.renderList(leftW - 2)) // -2 for the pane's horizontal padding
 
 	right := rightPaneStyle.
-		Width(rightWidth).
+		Width(rightW).
 		Height(contentHeight).
 		Render(m.renderDetail())
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	bar := barStyle.Width(m.width).Render("↑↓ navigate · s start · x stop · r restart · tab panel · q quit")
+	bar := barStyle.Width(m.width).Render("↑↓ navigate · s start · x stop · r restart · tab panel · pgup/pgdn scroll logs · q quit")
 
 	return lipgloss.JoinVertical(lipgloss.Left, panes, bar)
 }
 
-func (m Model) renderList(width int) string {
+// renderList draws the agent list. `inner` is the exact column budget for each
+// row (pane Width minus its horizontal padding). Every row is truncated to that
+// budget BEFORE styling (lipgloss .Width wraps, it does not truncate), then
+// rendered at .Width(inner) so selected and normal rows share an identical frame
+// — this is what keeps the box from shifting when the selection moves.
+func (m Model) renderList(inner int) string {
 	if m.loadErr != nil {
 		return fmt.Sprintf("error loading config:\n%v", m.loadErr)
 	}
@@ -118,46 +402,83 @@ func (m Model) renderList(width int) string {
 		return "No agents configured.\n\nAdd entries to ~/.launchd-tui"
 	}
 
-	var b strings.Builder
+	lines := make([]string, len(m.agents))
 	for i, agent := range m.agents {
 		var state launchd.AgentState
 		if i < len(m.states) {
 			state = m.states[i]
 		}
 
-		icon := launchd.StatusIcon(state.Status)
-		iconStyled := statusIconStyle(state.Status).Render(icon)
-		name := agent.DisplayName()
-		row := fmt.Sprintf(" %s  %s", iconStyled, name)
-
-		if i == m.cursor {
-			b.WriteString(selectedRowStyle.Width(width).Render(row))
+		var icon string
+		if i == m.actionIdx {
+			icon = m.spinner.View()
 		} else {
-			b.WriteString(rowStyle.Width(width).Render(row))
+			icon = statusIconStyle(state.Status, m.pulsePhase).Render(launchd.StatusIcon(state.Status))
 		}
-		if i < len(m.agents)-1 {
-			b.WriteString("\n")
+
+		// icon is width-1 + two-space gutter = 3 leading columns.
+		row := ansi.Truncate(icon+"  "+agent.DisplayName(), inner, "…")
+		if i == m.cursor {
+			lines[i] = selectedRowStyle.Width(inner).Render(row)
+		} else {
+			lines[i] = rowStyle.Width(inner).Render(row)
 		}
 	}
-	return b.String()
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderDetail() string {
 	if len(m.agents) == 0 || m.cursor >= len(m.agents) {
 		return "No agent selected."
 	}
-	agent := m.agents[m.cursor]
-	var state launchd.AgentState
-	if m.cursor < len(m.states) {
-		state = m.states[m.cursor]
-	}
 
-	return fmt.Sprintf(
-		"[L] Logs   [I] Info\n\nAgent:  %s\nStatus: %s\nPID:    %s",
-		agent.DisplayName(),
-		launchd.StatusLabel(state.Status),
-		pidStr(state.PID),
-	)
+	logsTab := inactiveTabStyle.Render("[L] Logs")
+	infoTab := inactiveTabStyle.Render("[I] Info")
+	if m.activeTab == tabLogs {
+		logsTab = activeTabStyle.Render("[L] Logs")
+	} else {
+		infoTab = activeTabStyle.Render("[I] Info")
+	}
+	tabBar := logsTab + "   " + infoTab
+
+	switch m.activeTab {
+	case tabLogs:
+		body := m.vp.View()
+		if m.logPath == "" {
+			body = dimStyle.Render("No log path configured in plist.")
+		} else if m.logContent == "" {
+			body = dimStyle.Render("(empty — waiting for output…)")
+		}
+		scrollHint := ""
+		if !m.autoScroll {
+			scrollHint = dimStyle.Render("  [scroll mode — G to resume]") + "\n"
+		}
+		return tabBar + "\n" + scrollHint + body
+
+	default: // tabInfo
+		agent := m.agents[m.cursor]
+		var state launchd.AgentState
+		if m.cursor < len(m.states) {
+			state = m.states[m.cursor]
+		}
+
+		rows := [][2]string{
+			{"Label", agent.Label},
+			{"Name", agent.DisplayName()},
+			{"Status", launchd.StatusLabel(state.Status)},
+			{"PID", pidStr(state.PID)},
+			{"Last exit", fmt.Sprintf("%d", state.ExitCode)},
+			{"Run count", fmt.Sprintf("%d", state.RunCount)},
+			{"Plist", fmt.Sprintf("~/Library/LaunchAgents/%s.plist", agent.Label)},
+		}
+
+		var b strings.Builder
+		b.WriteString(tabBar + "\n\n")
+		for _, row := range rows {
+			b.WriteString(infoLabelStyle.Render(row[0]) + "  " + infoValueStyle.Render(row[1]) + "\n")
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
 }
 
 func pidStr(pid int) string {

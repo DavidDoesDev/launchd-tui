@@ -1,8 +1,11 @@
 package launchd
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -22,15 +25,12 @@ type AgentState struct {
 	Status   Status
 	PID      int
 	ExitCode int
+	RunCount int
 }
 
 func GetState(label string) AgentState {
 	out, err := exec.Command("launchctl", "list", label).Output()
 	if err != nil {
-		if strings.Contains(err.Error(), "exit status 113") {
-			return AgentState{Label: label, Status: StatusNotFound}
-		}
-		// non-113 error: treat as not found
 		return AgentState{Label: label, Status: StatusNotFound}
 	}
 
@@ -61,7 +61,6 @@ func GetState(label string) AgentState {
 }
 
 func parseValue(line string) string {
-	// lines look like: "PID" = 1234;
 	parts := strings.SplitN(line, "=", 2)
 	if len(parts) != 2 {
 		return ""
@@ -70,6 +69,27 @@ func parseValue(line string) string {
 	v = strings.TrimSuffix(v, ";")
 	v = strings.Trim(v, `"`)
 	return strings.TrimSpace(v)
+}
+
+// LogPaths reads ~/Library/LaunchAgents/<label>.plist and returns
+// StandardOutPath and StandardErrorPath. Missing keys return "".
+func LogPaths(label string) (stdout, stderr string, err error) {
+	plistPath := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", label+".plist")
+	out, err := exec.Command("plutil", "-convert", "json", "-o", "-", plistPath).Output()
+	if err != nil {
+		return "", "", fmt.Errorf("plutil: %w", err)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(out, &data); err != nil {
+		return "", "", fmt.Errorf("parse plist: %w", err)
+	}
+	if v, ok := data["StandardOutPath"].(string); ok {
+		stdout = v
+	}
+	if v, ok := data["StandardErrorPath"].(string); ok {
+		stderr = v
+	}
+	return stdout, stderr, nil
 }
 
 func StatusIcon(s Status) string {
