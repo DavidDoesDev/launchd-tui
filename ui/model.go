@@ -408,23 +408,38 @@ func (m Model) renderList(inner int) string {
 		if i < len(m.states) {
 			state = m.states[i]
 		}
-
-		var icon string
-		if i == m.actionIdx {
-			icon = m.spinner.View()
-		} else {
-			icon = statusIconStyle(state.Status, m.pulsePhase).Render(launchd.StatusIcon(state.Status))
-		}
-
-		// icon is width-1 + two-space gutter = 3 leading columns.
-		row := ansi.Truncate(icon+"  "+agent.DisplayName(), inner, "…")
-		if i == m.cursor {
-			lines[i] = selectedRowStyle.Width(inner).Render(row)
-		} else {
-			lines[i] = rowStyle.Width(inner).Render(row)
-		}
+		lines[i] = m.renderRow(i, agent, state, inner)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// renderRow builds one list row as two background-carrying cells: a width-1
+// icon cell and a width-(inner-1) name cell that includes the 2-space gutter.
+// Rendering the cells separately (rather than embedding the pre-styled icon
+// inside one Render) keeps the selection background continuous across the
+// name text — a single Render would let the icon's SGR reset punch a hole in
+// the highlight everywhere except the trailing padding.
+func (m Model) renderRow(i int, agent config.Agent, state launchd.AgentState, inner int) string {
+	selected := i == m.cursor
+
+	iconStyle := statusIconStyle(state.Status, m.pulsePhase)
+	nameStyle := rowStyle
+	if selected {
+		iconStyle = iconStyle.Background(ctpSurface0)
+		nameStyle = selectedRowStyle
+	}
+
+	var iconSeg string
+	if i == m.actionIdx {
+		iconSeg = m.spinner.View()
+	} else {
+		iconSeg = iconStyle.Render(launchd.StatusIcon(state.Status))
+	}
+
+	name := ansi.Truncate(agent.DisplayName(), inner-3, "…") // -1 icon, -2 gutter
+	nameSeg := nameStyle.Width(inner - 1).Render("  " + name)
+
+	return iconSeg + nameSeg
 }
 
 func (m Model) renderDetail() string {
