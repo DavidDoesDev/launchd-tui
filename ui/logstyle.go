@@ -3,6 +3,7 @@ package ui
 import (
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -64,11 +65,104 @@ func (s Styles) styleLogLine(line string) string {
 	return "  " + s.severityStyle(line).Render(line)
 }
 
-// styleLog applies styleLogLine across a whole buffer.
-func (s Styles) styleLog(content string) string {
-	lines := strings.Split(content, "\n")
-	for i, l := range lines {
-		lines[i] = s.styleLogLine(l)
+// Datetime layouts tried against a line's leading timestamp token. Time-only
+// formats are intentionally absent — without a date a line can't be bucketed,
+// so it's treated as continuation output and inherits the prior line's bucket.
+var logLayouts = []string{
+	"2006-01-02T15:04:05Z07:00",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04:05",
+}
+
+// parseLogTime extracts an absolute time from a line's leading timestamp, or
+// reports false when there's no date to anchor it.
+func parseLogTime(line string) (time.Time, bool) {
+	loc := logTimestampRe.FindStringIndex(line)
+	if loc == nil {
+		return time.Time{}, false
 	}
-	return strings.Join(lines, "\n")
+	tok := strings.Trim(strings.TrimSpace(line[:loc[1]]), "[]")
+	for _, layout := range logLayouts {
+		if t, err := time.ParseInLocation(layout, tok, time.Local); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// bucketFor maps a timestamp to a relative section. The live window (most
+// recent 5 min) gets no header — it's the stream you're watching. Older entries
+// split per calendar day.
+func bucketFor(t, now time.Time) (id, label string, live bool) {
+	lt := t.Local()
+	switch d := now.Sub(t); {
+	case d < 5*time.Minute:
+		return "live", "", true
+	case d < time.Hour:
+		return "hour", "Last hour", false
+	case sameDay(lt, now):
+		return "today", "Earlier today", false
+	case sameDay(lt, now.AddDate(0, 0, -1)):
+		return "yesterday", "Yesterday", false
+	case d < 7*24*time.Hour:
+		return "week", "Earlier this week", false
+	default:
+		day := lt.Format("Jan 2")
+		if lt.Year() != now.Year() {
+			day = lt.Format("Jan 2, 2006")
+		}
+		return "older:" + day, day, false
+	}
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
+}
+
+// renderDivider draws a centered, uppercase section header flanked by heavy
+// rules, e.g. ━━━━━━ YESTERDAY ━━━━━━.
+func (s Styles) renderDivider(label string, width int) string {
+	if width < 12 {
+		width = 12
+	}
+	lbl := "  " + strings.ToUpper(label) + "  "
+	side := (width - lipgloss.Width(lbl)) / 2
+	if side < 2 {
+		side = 2
+	}
+	right := width - side - lipgloss.Width(lbl)
+	if right < 0 {
+		right = 0
+	}
+	return s.logDividerRule.Render(strings.Repeat("━", side)) +
+		s.logDividerLabel.Render(lbl) +
+		s.logDividerRule.Render(strings.Repeat("━", right))
+}
+
+// styleLog styles each line and inserts a time-section divider whenever the
+// bucket changes (except entering the live window). Lines without a parseable
+// date inherit the running bucket, so dividers only appear where they're
+// meaningful — a date-less log (e.g. time-only timestamps) gets none.
+func (s Styles) styleLog(content string, width int) string {
+	now := time.Now()
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	bucket := ""
+	for _, line := range lines {
+		if t, ok := parseLogTime(line); ok {
+			if id, label, live := bucketFor(t, now); id != bucket {
+				bucket = id
+				if !live {
+					if len(out) > 0 {
+						out = append(out, "", "") // generous margin above the header
+					}
+					out = append(out, s.renderDivider(label, width), "")
+				}
+			}
+		}
+		out = append(out, s.styleLogLine(line))
+	}
+	return strings.Join(out, "\n")
 }

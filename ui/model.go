@@ -233,7 +233,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// viewport sits inside the right pane: -2 for pane padding,
 		// -2 for the tab bar + its blank line.
 		m.vp = viewport.New(rightW-2, contentHeight-2)
-		m.vp.SetContent(m.styles.styleLog(m.logContent))
+		m.vp.SetContent(m.styles.styleLog(m.logContent, m.vp.Width))
 		if m.autoScroll {
 			m.vp.GotoBottom()
 		}
@@ -268,7 +268,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.content != "" {
 			m.logOffset += int64(len(msg.content))
 			m.logContent += msg.content
-			m.vp.SetContent(m.styles.styleLog(m.logContent))
+			m.vp.SetContent(m.styles.styleLog(m.logContent, m.vp.Width))
 			if m.autoScroll {
 				m.vp.GotoBottom()
 			}
@@ -456,44 +456,86 @@ func (m Model) renderList(inner int) string {
 		return "No agents configured.\n\nAdd entries to ~/.launchd-tui"
 	}
 
-	lines := make([]string, len(m.agents))
+	cards := make([]string, len(m.agents))
 	for i, agent := range m.agents {
 		var state launchd.AgentState
 		if i < len(m.states) {
 			state = m.states[i]
 		}
-		lines[i] = m.renderRow(i, agent, state, inner)
+		cards[i] = m.renderCard(i, agent, state, inner)
 	}
-	return strings.Join(lines, "\n")
+	// Blank spacer line between cards (left unfilled, herdr-style).
+	return "\n" + strings.Join(cards, "\n\n")
 }
 
-// renderRow builds one list row as two background-carrying cells: a width-1
-// icon cell and a width-(inner-1) name cell that includes the 2-space gutter.
-// Rendering the cells separately (rather than embedding the pre-styled icon
-// inside one Render) keeps the selection background continuous across the
-// name text — a single Render would let the icon's SGR reset punch a hole in
-// the highlight everywhere except the trailing padding.
-func (m Model) renderRow(i int, agent config.Agent, state launchd.AgentState, inner int) string {
+// renderCard draws one agent as a two-line card: line 1 is the status icon +
+// name, line 2 an indented status line (state + pid/exit). The selected card
+// fills its full width with the surface background. Every visible segment —
+// including gaps and trailing pad — carries the background when selected, so
+// there are no SGR-reset holes across the fill (see bgIf).
+func (m Model) renderCard(i int, agent config.Agent, state launchd.AgentState, inner int) string {
 	selected := i == m.cursor
+	bg := m.styles.theme.Surface0
 
-	iconStyle := m.styles.statusIcon(state.Status, m.pulsePhase && m.settings.Animations)
-	nameStyle := m.styles.row
-	if selected {
-		iconStyle = iconStyle.Background(m.styles.theme.Surface0)
-		nameStyle = m.styles.selectedRow
-	}
-
+	// line 1: icon + name
 	var iconSeg string
 	if i == m.actionIdx {
 		iconSeg = m.spinner.View()
 	} else {
-		iconSeg = iconStyle.Render(launchd.StatusIcon(state.Status))
+		ist := m.styles.statusIcon(state.Status, m.pulsePhase && m.settings.Animations)
+		iconSeg = bgIf(ist, selected, bg).Render(launchd.StatusIcon(state.Status))
 	}
+	nameStyle := m.styles.row
+	if selected {
+		nameStyle = m.styles.selectedRow.Bold(true)
+	}
+	name := ansi.Truncate(agent.DisplayName(), inner-4, "…")
+	line1 := m.bgSpace(1, selected) + iconSeg + m.bgSpace(2, selected) + bgIf(nameStyle, selected, bg).Render(name)
+	line1 = m.padTo(line1, inner, selected)
 
-	name := ansi.Truncate(agent.DisplayName(), inner-3, "…") // -1 icon, -2 gutter
-	nameSeg := nameStyle.Width(inner - 1).Render("  " + name)
+	// line 2: status line
+	label, extra := statusLineText(state)
+	line2 := m.bgSpace(5, selected) + bgIf(m.styles.statusLabel(state.Status), selected, bg).Render(label)
+	if extra != "" {
+		line2 += bgIf(m.styles.dim, selected, bg).Render(" · " + extra)
+	}
+	line2 = m.padTo(line2, inner, selected)
 
-	return iconSeg + nameSeg
+	return line1 + "\n" + line2
+}
+
+// bgSpace returns n spaces, background-filled when selected.
+func (m Model) bgSpace(n int, selected bool) string {
+	s := strings.Repeat(" ", n)
+	if selected {
+		return lipgloss.NewStyle().Background(m.styles.theme.Surface0).Render(s)
+	}
+	return s
+}
+
+// padTo right-pads a composed line to inner columns, filling with background
+// when selected.
+func (m Model) padTo(line string, inner int, selected bool) string {
+	if w := lipgloss.Width(line); w < inner {
+		return line + m.bgSpace(inner-w, selected)
+	}
+	return line
+}
+
+// statusLineText returns the card's second-line label and optional detail.
+func statusLineText(s launchd.AgentState) (label, extra string) {
+	switch s.Status {
+	case launchd.StatusRunning:
+		return "running", fmt.Sprintf("pid %d", s.PID)
+	case launchd.StatusStopped:
+		return "stopped", ""
+	case launchd.StatusErrored:
+		return "errored", fmt.Sprintf("exit %d", s.ExitCode)
+	case launchd.StatusNotFound:
+		return "not loaded", ""
+	default:
+		return "—", ""
+	}
 }
 
 func (m Model) renderDetail() string {
