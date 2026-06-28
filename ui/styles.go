@@ -5,86 +5,99 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Catppuccin Mocha palette
-const (
-	ctpBase    = lipgloss.Color("#1e1e2e")
-	ctpMantle  = lipgloss.Color("#181825")
-	ctpSurface0 = lipgloss.Color("#313244")
-	ctpSurface1 = lipgloss.Color("#45475a")
-	ctpOverlay0 = lipgloss.Color("#6c7086")
-	ctpSubtext0 = lipgloss.Color("#a6adc8")
-	ctpText     = lipgloss.Color("#cdd6f4")
-	ctpGreen    = lipgloss.Color("#a6e3a1")
-	ctpGreenDim = lipgloss.Color("#4a6741")
-	ctpRed      = lipgloss.Color("#f38ba8")
-	ctpYellow   = lipgloss.Color("#f9e2af")
-	ctpBlue     = lipgloss.Color("#89b4fa")
-	ctpMauve    = lipgloss.Color("#cba6f7")
-)
+// Styles holds every lipgloss.Style the UI renders with, derived from a Theme.
+// It's rebuilt (newStyles) whenever the active theme changes, so rendering code
+// reads m.styles.X instead of package-level globals — themes become swappable
+// at runtime.
+type Styles struct {
+	theme Theme
 
-var (
-	leftPaneStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ctpSurface1).
-			Padding(0, 1)
+	leftPane    lipgloss.Style
+	rightPane   lipgloss.Style
+	bar         lipgloss.Style
+	row         lipgloss.Style
+	selectedRow lipgloss.Style
 
-	rightPaneStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ctpSurface1).
-			Padding(0, 1)
+	iconRunning    lipgloss.Style
+	iconRunningDim lipgloss.Style
+	iconStopped    lipgloss.Style
+	iconErrored    lipgloss.Style
+	iconUnknown    lipgloss.Style
 
-	barStyle = lipgloss.NewStyle().
-			Background(ctpMantle).
-			Foreground(ctpOverlay0).
-			Padding(0, 1)
+	spinner     lipgloss.Style
+	activeTab   lipgloss.Style
+	inactiveTab lipgloss.Style
+	infoLabel   lipgloss.Style
+	infoValue   lipgloss.Style
+	dim         lipgloss.Style
 
-	rowStyle = lipgloss.NewStyle().
-			Foreground(ctpSubtext0)
+	logTimestamp lipgloss.Style
+	logError     lipgloss.Style
+	logWarn      lipgloss.Style
+	logSuccess   lipgloss.Style
+	logDefault   lipgloss.Style
 
-	selectedRowStyle = lipgloss.NewStyle().
-				Foreground(ctpText).
-				Background(ctpSurface0)
+	modal      lipgloss.Style
+	modalTitle lipgloss.Style
+	modalRow   lipgloss.Style
+	modalRowOn lipgloss.Style
+	modalValue lipgloss.Style
+}
 
-	iconRunning    = lipgloss.NewStyle().Foreground(ctpGreen)
-	iconRunningDim = lipgloss.NewStyle().Foreground(ctpGreenDim)
-	iconStopped    = lipgloss.NewStyle().Foreground(ctpOverlay0)
-	iconErrored    = lipgloss.NewStyle().Foreground(ctpRed)
-	iconUnknown    = lipgloss.NewStyle().Foreground(ctpSurface1)
+func newStyles(t Theme) Styles {
+	return Styles{
+		theme: t,
 
-	spinnerStyle = lipgloss.NewStyle().Foreground(ctpYellow)
+		leftPane: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).BorderForeground(t.Surface1).Padding(0, 1),
+		rightPane: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).BorderForeground(t.Surface1).Padding(0, 1),
+		bar: lipgloss.NewStyle().
+			Background(t.Mantle).Foreground(t.Overlay0).Padding(0, 1),
+		row:         lipgloss.NewStyle().Foreground(t.Subtext0),
+		selectedRow: lipgloss.NewStyle().Foreground(t.Text).Background(t.Surface0),
 
-	activeTabStyle = lipgloss.NewStyle().
-			Foreground(ctpBlue).
-			Bold(true).
-			Underline(true)
+		iconRunning:    lipgloss.NewStyle().Foreground(t.Green),
+		iconRunningDim: lipgloss.NewStyle().Foreground(t.GreenDim),
+		iconStopped:    lipgloss.NewStyle().Foreground(t.Overlay0),
+		iconErrored:    lipgloss.NewStyle().Foreground(t.Red),
+		iconUnknown:    lipgloss.NewStyle().Foreground(t.Surface1),
 
-	inactiveTabStyle = lipgloss.NewStyle().
-				Foreground(ctpOverlay0)
+		spinner:     lipgloss.NewStyle().Foreground(t.Yellow),
+		activeTab:   lipgloss.NewStyle().Foreground(t.Blue).Bold(true).Underline(true),
+		inactiveTab: lipgloss.NewStyle().Foreground(t.Overlay0),
+		infoLabel:   lipgloss.NewStyle().Foreground(t.Overlay0).Width(12),
+		infoValue:   lipgloss.NewStyle().Foreground(t.Text),
+		dim:         lipgloss.NewStyle().Foreground(t.Surface1).Italic(true),
 
-	infoLabelStyle = lipgloss.NewStyle().
-			Foreground(ctpOverlay0).
-			Width(12)
+		logTimestamp: lipgloss.NewStyle().Foreground(t.Overlay0),
+		logError:     lipgloss.NewStyle().Foreground(t.Red),
+		logWarn:      lipgloss.NewStyle().Foreground(t.Yellow),
+		logSuccess:   lipgloss.NewStyle().Foreground(t.Green),
+		logDefault:   lipgloss.NewStyle().Foreground(t.Subtext0),
 
-	infoValueStyle = lipgloss.NewStyle().
-			Foreground(ctpText)
+		modal: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).BorderForeground(t.Mauve).
+			Background(t.Base).Padding(1, 2),
+		modalTitle: lipgloss.NewStyle().Foreground(t.Mauve).Bold(true),
+		modalRow:   lipgloss.NewStyle().Foreground(t.Subtext0),
+		modalRowOn: lipgloss.NewStyle().Foreground(t.Text).Bold(true),
+		modalValue: lipgloss.NewStyle().Foreground(t.Blue),
+	}
+}
 
-	dimStyle = lipgloss.NewStyle().
-			Foreground(ctpSurface1).
-			Italic(true)
-)
-
-func statusIconStyle(s launchd.Status, pulse bool) lipgloss.Style {
-	switch s {
+func (s Styles) statusIcon(status launchd.Status, pulse bool) lipgloss.Style {
+	switch status {
 	case launchd.StatusRunning:
 		if pulse {
-			return iconRunningDim
+			return s.iconRunningDim
 		}
-		return iconRunning
+		return s.iconRunning
 	case launchd.StatusStopped:
-		return iconStopped
+		return s.iconStopped
 	case launchd.StatusErrored:
-		return iconErrored
+		return s.iconErrored
 	default:
-		return iconUnknown
+		return s.iconUnknown
 	}
 }

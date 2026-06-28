@@ -71,13 +71,24 @@ type Model struct {
 	logPath        string
 	logOffset      int64
 	tailGen        int
+	styles         Styles
+	settings       config.Settings
+	showSettings   bool
+	settingsCursor int
 }
 
 func New() Model {
 	cfg, err := config.Load()
+	settings := config.LoadSettings()
+
+	theme := mochaTheme
+	if t, ok := themeByName(settings.Theme); ok {
+		theme = t
+	}
+	styles := newStyles(theme)
 	sp := spinner.New(
 		spinner.WithSpinner(spinner.MiniDot),
-		spinner.WithStyle(spinnerStyle),
+		spinner.WithStyle(styles.spinner),
 	)
 	return Model{
 		agents:     cfg.Agents,
@@ -87,11 +98,24 @@ func New() Model {
 		autoScroll: true,
 		spinner:    sp,
 		actionIdx:  -1,
+		styles:     styles,
+		settings:   settings,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchAllStates(m.agents), pollCmd(), pulseCmd())
+	cmds := []tea.Cmd{fetchAllStates(m.agents), pollCmd(m.pollDuration()), pulseCmd()}
+	if m.settings.MouseWheel {
+		cmds = append(cmds, tea.EnableMouseCellMotion)
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m Model) pollDuration() time.Duration {
+	if m.settings.PollIntervalSec > 0 {
+		return time.Duration(m.settings.PollIntervalSec) * time.Second
+	}
+	return pollInterval
 }
 
 func pulseCmd() tea.Cmd {
@@ -100,8 +124,8 @@ func pulseCmd() tea.Cmd {
 
 // --- commands ---
 
-func pollCmd() tea.Cmd {
-	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollMsg{} })
+func pollCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return pollMsg{} })
 }
 
 func fetchAllStates(agents []config.Agent) tea.Cmd {
@@ -209,7 +233,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// viewport sits inside the right pane: -2 for pane padding,
 		// -2 for the tab bar + its blank line.
 		m.vp = viewport.New(rightW-2, contentHeight-2)
-		m.vp.SetContent(styleLog(m.logContent))
+		m.vp.SetContent(m.styles.styleLog(m.logContent))
 		if m.autoScroll {
 			m.vp.GotoBottom()
 		}
@@ -225,7 +249,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, pulseCmd())
 
 	case pollMsg:
-		cmds = append(cmds, fetchAllStates(m.agents), pollCmd())
+		cmds = append(cmds, fetchAllStates(m.agents), pollCmd(m.pollDuration()))
 
 	case tea.MouseMsg:
 		// Wheel-scroll the log viewport; re-sync auto-scroll to whether we
@@ -244,7 +268,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.content != "" {
 			m.logOffset += int64(len(msg.content))
 			m.logContent += msg.content
-			m.vp.SetContent(styleLog(m.logContent))
+			m.vp.SetContent(m.styles.styleLog(m.logContent))
 			if m.autoScroll {
 				m.vp.GotoBottom()
 			}
@@ -273,9 +297,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case tea.KeyMsg:
+		// While the settings modal is open it captures all keys.
+		if m.showSettings {
+			var cmd tea.Cmd
+			m, cmd = m.handleSettingsKey(msg)
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+
+		case ",":
+			m.showSettings = true
+			return m, nil
 
 		case "up", "k":
 			if m.cursor > 0 {
@@ -383,20 +418,29 @@ func (m Model) View() string {
 
 	leftW, rightW, contentHeight := m.layout()
 
-	left := leftPaneStyle.
+	left := m.styles.leftPane.
 		Width(leftW).
 		Height(contentHeight).
 		Render(m.renderList(leftW - 2)) // -2 for the pane's horizontal padding
 
-	right := rightPaneStyle.
+	right := m.styles.rightPane.
 		Width(rightW).
 		Height(contentHeight).
 		Render(m.renderDetail())
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	bar := barStyle.Width(m.width).Render("↑↓ navigate · s start · x stop · r restart · tab panel · pgup/pgdn scroll logs · q quit")
+	bar := m.styles.bar.Width(m.width).Render("↑↓ navigate · s/x/r start/stop/restart · tab panel · , settings · q quit")
 
-	return lipgloss.JoinVertical(lipgloss.Left, panes, bar)
+	view := lipgloss.JoinVertical(lipgloss.Left, panes, bar)
+
+	if m.showSettings {
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			m.renderSettings(),
+			lipgloss.WithWhitespaceChars(" "),
+		)
+	}
+	return view
 }
 
 // renderList draws the agent list. `inner` is the exact column budget for each
@@ -432,11 +476,11 @@ func (m Model) renderList(inner int) string {
 func (m Model) renderRow(i int, agent config.Agent, state launchd.AgentState, inner int) string {
 	selected := i == m.cursor
 
-	iconStyle := statusIconStyle(state.Status, m.pulsePhase)
-	nameStyle := rowStyle
+	iconStyle := m.styles.statusIcon(state.Status, m.pulsePhase && m.settings.Animations)
+	nameStyle := m.styles.row
 	if selected {
-		iconStyle = iconStyle.Background(ctpSurface0)
-		nameStyle = selectedRowStyle
+		iconStyle = iconStyle.Background(m.styles.theme.Surface0)
+		nameStyle = m.styles.selectedRow
 	}
 
 	var iconSeg string
@@ -457,12 +501,12 @@ func (m Model) renderDetail() string {
 		return "No agent selected."
 	}
 
-	logsTab := inactiveTabStyle.Render("[L] Logs")
-	infoTab := inactiveTabStyle.Render("[I] Info")
+	logsTab := m.styles.inactiveTab.Render("[L] Logs")
+	infoTab := m.styles.inactiveTab.Render("[I] Info")
 	if m.activeTab == tabLogs {
-		logsTab = activeTabStyle.Render("[L] Logs")
+		logsTab = m.styles.activeTab.Render("[L] Logs")
 	} else {
-		infoTab = activeTabStyle.Render("[I] Info")
+		infoTab = m.styles.activeTab.Render("[I] Info")
 	}
 	tabBar := logsTab + "   " + infoTab
 
@@ -470,13 +514,13 @@ func (m Model) renderDetail() string {
 	case tabLogs:
 		body := m.vp.View()
 		if m.logPath == "" {
-			body = dimStyle.Render("No log path configured in plist.")
+			body = m.styles.dim.Render("No log path configured in plist.")
 		} else if m.logContent == "" {
-			body = dimStyle.Render("(empty — waiting for output…)")
+			body = m.styles.dim.Render("(empty — waiting for output…)")
 		}
 		scrollHint := ""
 		if !m.autoScroll {
-			scrollHint = dimStyle.Render("  [scroll mode — G to resume]") + "\n"
+			scrollHint = m.styles.dim.Render("  [scroll mode — G to resume]") + "\n"
 		}
 		return tabBar + "\n" + scrollHint + body
 
@@ -500,7 +544,7 @@ func (m Model) renderDetail() string {
 		var b strings.Builder
 		b.WriteString(tabBar + "\n\n")
 		for _, row := range rows {
-			b.WriteString(infoLabelStyle.Render(row[0]) + "  " + infoValueStyle.Render(row[1]) + "\n")
+			b.WriteString(m.styles.infoLabel.Render(row[0]) + "  " + m.styles.infoValue.Render(row[1]) + "\n")
 		}
 		return strings.TrimRight(b.String(), "\n")
 	}
