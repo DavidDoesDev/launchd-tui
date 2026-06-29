@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -109,10 +111,11 @@ func sparkleLift(r, c, frame int) float64 {
 }
 
 // renderTimeline draws a single full-width dot-matrix activity chart `height`
-// rows tall: each column is a bucket, its bar a stack of ● dots scaled by log
-// volume, colored by the worst severity in that time slice. One dot per cell
-// means each point is independently colorable — so the sparkle can twinkle
-// individual dots rather than whole clusters.
+// rows tall: each column is a bucket, its bar a stack of ⣿ dots scaled by log
+// volume, colored by the worst severity in that time slice. A dotted "typical"
+// guide line sits at the median of the active buckets (robust to bursts) and
+// is labeled with the count + bucket width, so the y-axis is legible. One dot
+// per cell keeps each point independently colorable for the sparkle.
 func (s Styles) renderTimeline(content string, width, height, frame int, sparkle bool) string {
 	if width < 4 || height < 2 {
 		return ""
@@ -125,36 +128,107 @@ func (s Styles) renderTimeline(content string, width, height, frame int, sparkle
 	}
 
 	maxCount := 1
+	var active []int
 	for _, b := range buckets {
 		if b.count > maxCount {
 			maxCount = b.count
 		}
+		if b.count > 0 {
+			active = append(active, b.count)
+		}
+	}
+
+	// Median "typical" level + the row it sits on (top of a median-height bar).
+	med := median(active)
+	medLevel := int(float64(med)/float64(maxCount)*float64(chartH) + 0.5)
+	if medLevel < 1 {
+		medLevel = 1
+	}
+	if medLevel > chartH {
+		medLevel = chartH
+	}
+	guideRow := chartH - medLevel
+
+	// Bucket width label, e.g. "typical 22 per 3m".
+	span := end.Sub(start)
+	if span <= 0 {
+		span = time.Minute
+	}
+	label := fmt.Sprintf("typical %d lines per %s", med, humanizeDur(span/time.Duration(width)))
+	labelW := lipgloss.Width(label)
+
+	barCell := func(r, c, h int) string {
+		col := s.tlSeverityColor(buckets[c].sev)
+		if sparkle {
+			if lift := sparkleLift(r, c, frame); lift > 0 {
+				col = lighten(col, lift)
+			}
+		}
+		return lipgloss.NewStyle().Foreground(col).Render("⣿")
 	}
 
 	var sb strings.Builder
 	for r := 0; r < chartH; r++ {
 		for c := 0; c < width; c++ {
+			// Overlay the label across the left of the guide row.
+			if r == guideRow && c < labelW {
+				if c == 0 {
+					sb.WriteString(s.logDividerLabel.Render(label)) // blue+bold, like a title
+				}
+				continue
+			}
 			b := buckets[c]
 			h := int(float64(b.count)/float64(maxCount)*float64(chartH) + 0.5)
 			if b.count > 0 && h == 0 {
 				h = 1 // always show at least one dot where there's any activity
 			}
-			if chartH-1-r >= h { // above the bar top
-				sb.WriteByte(' ')
-				continue
-			}
-			col := s.tlSeverityColor(b.sev)
-			if sparkle {
-				if lift := sparkleLift(r, c, frame); lift > 0 {
-					col = lighten(col, lift)
+			switch {
+			case chartH-1-r < h: // within this column's bar
+				sb.WriteString(barCell(r, c, h))
+			case r == guideRow: // on the guide line, no bar here
+				col := s.theme.Surface1
+				if sparkle && ((c-frame)%7+7)%7 == 0 {
+					col = lighten(col, 0.6) // a brighter dot marches along the line
 				}
+				sb.WriteString(lipgloss.NewStyle().Foreground(col).Render("·"))
+			default:
+				sb.WriteByte(' ')
 			}
-			sb.WriteString(lipgloss.NewStyle().Foreground(col).Render("⣿"))
 		}
 		sb.WriteByte('\n')
 	}
 	sb.WriteString(s.renderAxis(start, end, width))
 	return sb.String()
+}
+
+func median(xs []int) int {
+	if len(xs) == 0 {
+		return 1
+	}
+	s := append([]int(nil), xs...)
+	sort.Ints(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
+}
+
+func humanizeDur(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours())/24)
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		s := int(d.Seconds())
+		if s < 1 {
+			s = 1
+		}
+		return fmt.Sprintf("%ds", s)
+	}
 }
 
 // renderAxis draws a tick row (┬ marks on a rule) and a label row beneath it,
@@ -220,7 +294,7 @@ func (s Styles) renderLoadingTimeline(width, height, frame int) string {
 		n = 6
 	}
 	for i := 0; i < n; i++ {
-		ticks[int(float64(i)/float64(n-1)*float64(width-1)+0.5)] = '┬'
+		ticks[int(float64(i)/float64(n-1)*float64(width-1)+0.5)] = '┴'
 	}
 	sb.WriteString(s.logDividerRule.Render(string(ticks)))
 	sb.WriteByte('\n')
@@ -242,7 +316,7 @@ func (s Styles) renderAxis(start, end time.Time, width int) string {
 	for i := 0; i < n; i++ {
 		frac := float64(i) / float64(n-1)
 		col := int(frac*float64(width-1) + 0.5)
-		ticks[col] = '┬'
+		ticks[col] = '┴'
 
 		t := start.Add(time.Duration(float64(span) * frac))
 		last := i == n-1

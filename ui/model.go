@@ -72,6 +72,7 @@ type Model struct {
 	settings       config.Settings
 	showSettings   bool
 	settingsCursor int
+	showHelp       bool
 	showSwatches   bool // TEMP: swatch reference
 	loadFrame      int  // animation frame for the loading placeholder
 	animating      bool // a loading-animation ticker is in flight
@@ -353,6 +354,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m, cmd = m.handleSettingsKey(msg)
 			return m, cmd
 		}
+		// The help / swatch overlays capture all keys; close on esc (or their
+		// own toggle / q).
+		if m.showHelp || m.showSwatches {
+			switch msg.String() {
+			case "esc", "?", "0", "q":
+				m.showHelp = false
+				m.showSwatches = false
+			}
+			return m, nil
+		}
 
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -362,12 +373,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showSettings = true
 			return m, nil
 
-		case "0": // TEMP: toggle swatch reference
-			m.showSwatches = !m.showSwatches
+		case "?":
+			m.showHelp = true
 			return m, nil
 
-		case "esc":
-			m.showSwatches = false
+		case "0": // TEMP: swatch reference
+			m.showSwatches = true
 			return m, nil
 
 		case "up", "k":
@@ -500,10 +511,15 @@ func (m Model) View() string {
 		Render(m.renderDetail(rightContentW))
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	bar := m.styles.bar.Width(m.width).Render("↑↓ navigate · s/x/r start/stop/restart · tab panel · , settings · q quit")
+	bar := m.styles.bar.Width(m.width).Render("↑↓ navigate · s/x/r start/stop/restart · tab panel · , settings · ? help · q quit")
 
 	view := lipgloss.JoinVertical(lipgloss.Left, panes, bar)
 
+	if m.showHelp {
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center, m.renderHelp(),
+			lipgloss.WithWhitespaceChars(" "))
+	}
 	if m.showSwatches { // TEMP
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center, m.renderSwatches(),
