@@ -544,7 +544,9 @@ func (m Model) renderCard(i int, agent config.Agent, state launchd.AgentState, i
 
 	var iconSeg string
 	if i == m.actionIdx {
-		iconSeg = m.spinner.View()
+		sp := m.spinner // copy so we can apply the card bg without mutating state
+		sp.Style = withBG(m.styles.spinner, bg)
+		iconSeg = sp.View()
 	} else {
 		iconSeg = withBG(m.styles.statusIcon(state.Status), bg).Render(launchd.StatusIcon(state.Status))
 	}
