@@ -27,16 +27,30 @@ var logTimestampRe = regexp.MustCompile(
 	`^(\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}Z?\]?|\[\d{2}:\d{2}:\d{2}\])\s*`,
 )
 
-func (s Styles) severityStyle(line string) lipgloss.Style {
+// severityClass ranks a line: 0 normal, 1 warn, 2 error. Used by both the line
+// styler and the activity timeline so they agree on what "bad" looks like.
+func severityClass(line string) int {
 	l := strings.ToLower(line)
 	switch {
 	case containsAny(l, errorWords):
-		return s.logError
+		return 2
 	case containsAny(l, warnWords):
-		return s.logWarn
-	case containsAny(l, successWords):
-		return s.logSuccess
+		return 1
 	default:
+		return 0
+	}
+}
+
+func (s Styles) severityStyle(line string) lipgloss.Style {
+	switch severityClass(line) {
+	case 2:
+		return s.logError
+	case 1:
+		return s.logWarn
+	default:
+		if containsAny(strings.ToLower(line), successWords) {
+			return s.logSuccess
+		}
 		return s.logDefault
 	}
 }
@@ -92,7 +106,7 @@ func parseLogTime(line string) (time.Time, bool) {
 
 // bucketFor maps a timestamp to a relative section. The live window (most
 // recent 5 min) gets no header — it's the stream you're watching. Older entries
-// split per calendar day.
+// split per calendar day with a date label.
 func bucketFor(t, now time.Time) (id, label string, live bool) {
 	lt := t.Local()
 	switch d := now.Sub(t); {
@@ -155,10 +169,8 @@ func (s Styles) styleLog(content string, width int) string {
 			if id, label, live := bucketFor(t, now); id != bucket {
 				bucket = id
 				if !live {
-					if len(out) > 0 {
-						out = append(out, "", "") // generous margin above the header
-					}
-					out = append(out, s.renderDivider(label, width), "")
+					// A full blank line on each side of the header.
+					out = append(out, "", s.renderDivider(label, width), "")
 				}
 			}
 		}

@@ -3,7 +3,28 @@ package ui
 import (
 	"github.com/DavidDoesDev/launchd-tui/launchd"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/lucasb-eyer/go-colorful"
 )
+
+// blend mixes two hex colors by t (0 = a, 1 = b).
+func blend(a, b lipgloss.Color, t float64) lipgloss.Color {
+	ca, err1 := colorful.Hex(string(a))
+	cb, err2 := colorful.Hex(string(b))
+	if err1 != nil || err2 != nil {
+		return a
+	}
+	return lipgloss.Color(ca.BlendRgb(cb, t).Hex())
+}
+
+// desaturate scales a color's saturation toward grey (factor 0 = fully grey).
+func desaturate(c lipgloss.Color, factor float64) lipgloss.Color {
+	cc, err := colorful.Hex(string(c))
+	if err != nil {
+		return c
+	}
+	h, s, l := cc.Hsl()
+	return lipgloss.Color(colorful.Hsl(h, s*factor, l).Hex())
+}
 
 // Styles holds every lipgloss.Style the UI renders with, derived from a Theme.
 // It's rebuilt (newStyles) whenever the active theme changes, so rendering code
@@ -11,6 +32,7 @@ import (
 // at runtime.
 type Styles struct {
 	theme Theme
+	selBg lipgloss.Color // subtle selection background
 
 	leftPane    lipgloss.Style
 	rightPane   lipgloss.Style
@@ -53,17 +75,19 @@ type Styles struct {
 }
 
 func newStyles(t Theme) Styles {
+	selBg := desaturate(blend(t.Base, t.Surface0, 0.5), 0.4)
 	return Styles{
 		theme: t,
+		selBg: selBg,
 
-		leftPane: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).BorderForeground(t.Surface1).Padding(0, 1),
+		leftPane: lipgloss.NewStyle().Padding(0, 1),
 		rightPane: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).BorderForeground(t.Surface1).Padding(0, 1),
+			Border(lipgloss.RoundedBorder()).BorderForeground(t.Surface1).
+			Padding(1, 2), // ~2× the usual pane padding
 		bar: lipgloss.NewStyle().
 			Background(t.Mantle).Foreground(t.Overlay0).Padding(0, 1),
 		row:         lipgloss.NewStyle().Foreground(t.Subtext0),
-		selectedRow: lipgloss.NewStyle().Foreground(t.Text).Background(t.Surface0),
+		selectedRow: lipgloss.NewStyle().Foreground(t.Text).Background(selBg),
 
 		iconRunning:    lipgloss.NewStyle().Foreground(t.Green),
 		iconRunningDim: lipgloss.NewStyle().Foreground(t.GreenDim),
@@ -85,7 +109,7 @@ func newStyles(t Theme) Styles {
 		logDefault:   lipgloss.NewStyle().Foreground(t.Subtext0),
 
 		logDividerRule:  lipgloss.NewStyle().Foreground(t.Surface1),
-		logDividerLabel: lipgloss.NewStyle().Foreground(t.Mauve).Bold(true),
+		logDividerLabel: lipgloss.NewStyle().Foreground(t.Blue).Bold(true),
 
 		statusRunning: lipgloss.NewStyle().Foreground(t.Green),
 		statusStopped: lipgloss.NewStyle().Foreground(t.Subtext0),
@@ -116,6 +140,27 @@ func (s Styles) statusIcon(status launchd.Status, pulse bool) lipgloss.Style {
 	default:
 		return s.iconUnknown
 	}
+}
+
+// statusSelBg returns the selected-card background: a faint, slightly
+// desaturated wash of the status color over the base, so the highlight subtly
+// echoes the agent's state.
+func (s Styles) statusSelBg(status launchd.Status) lipgloss.Color {
+	var c lipgloss.Color
+	switch status {
+	case launchd.StatusRunning:
+		c = s.theme.Green
+	case launchd.StatusErrored:
+		c = s.theme.Red
+	case launchd.StatusStopped:
+		c = s.theme.Subtext0
+	default:
+		c = s.theme.Overlay0
+	}
+	// Lift the base most of the way to surface0 — a solid, clearly-present
+	// surface — then wash a subtle status tint over it.
+	surface := blend(s.theme.Base, s.theme.Surface0, 0.9)
+	return blend(surface, c, 0.16)
 }
 
 func (s Styles) statusLabel(status launchd.Status) lipgloss.Style {

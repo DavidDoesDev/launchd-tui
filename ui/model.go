@@ -19,6 +19,7 @@ import (
 const pollInterval = 2 * time.Second
 const logTailInterval = 500 * time.Millisecond
 const pulseInterval = 800 * time.Millisecond
+const timelineHeight = 10 // activity chart rows atop the log view (incl. 2-row axis)
 
 const (
 	tabLogs = 0
@@ -75,6 +76,17 @@ type Model struct {
 	settings       config.Settings
 	showSettings   bool
 	settingsCursor int
+	showSwatches   bool // TEMP: swatch picker
+	loadFrame      int  // animation frame for the loading placeholder
+	animating      bool // a loading-animation ticker is in flight
+}
+
+type loadAnimMsg struct{}
+
+const loadAnimInterval = 90 * time.Millisecond
+
+func loadAnimCmd() tea.Cmd {
+	return tea.Tick(loadAnimInterval, func(time.Time) tea.Msg { return loadAnimMsg{} })
 }
 
 func New() Model {
@@ -207,7 +219,9 @@ func resolveLogPath(label string) string {
 }
 
 func (m *Model) startTail() tea.Cmd {
-	if m.activeTab != tabLogs || len(m.agents) == 0 || m.cursor >= len(m.agents) {
+	// Tails regardless of active tab so the activity timeline stays live on the
+	// Info tab too.
+	if len(m.agents) == 0 || m.cursor >= len(m.agents) {
 		return nil
 	}
 	path := resolveLogPath(m.agents[m.cursor].Label)
@@ -217,7 +231,14 @@ func (m *Model) startTail() tea.Cmd {
 	m.logContent = ""
 	m.autoScroll = true
 	m.vp.SetContent("")
-	return tailCmd(path, 0, m.tailGen)
+
+	cmds := []tea.Cmd{tailCmd(path, 0, m.tailGen)}
+	// Kick the loading animation (once) while we wait for the first content.
+	if !m.animating && path != "" {
+		m.animating = true
+		cmds = append(cmds, loadAnimCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 // --- update ---
@@ -229,10 +250,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		_, rightW, contentHeight := m.layout()
-		// viewport sits inside the right pane: -2 for pane padding,
-		// -2 for the tab bar + its blank line.
-		m.vp = viewport.New(rightW-2, contentHeight-2)
+		_, _, _, _, rightContentW, rightContentH := m.layout()
+		// Reserve rows in the right pane: timeline + 2 blanks + tab bar + 2 blanks.
+		m.vp = viewport.New(rightContentW, rightContentH-timelineHeight-5)
 		m.vp.SetContent(m.styles.styleLog(m.logContent, m.vp.Width))
 		if m.autoScroll {
 			m.vp.GotoBottom()
@@ -247,6 +267,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pulseMsg:
 		m.pulsePhase = !m.pulsePhase
 		cmds = append(cmds, pulseCmd())
+
+	case loadAnimMsg:
+		// Advance the loading wave only while still loading; otherwise let the
+		// ticker die.
+		if m.logContent == "" && m.logPath != "" {
+			m.loadFrame++
+			cmds = append(cmds, loadAnimCmd())
+		} else {
+			m.animating = false
+		}
 
 	case pollMsg:
 		cmds = append(cmds, fetchAllStates(m.agents), pollCmd(m.pollDuration()))
@@ -310,6 +340,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case ",":
 			m.showSettings = true
+			return m, nil
+
+		case "0": // TEMP: toggle swatch picker
+			m.showSwatches = !m.showSwatches
+			return m, nil
+
+		case "esc":
+			m.showSwatches = false
 			return m, nil
 
 		case "up", "k":
@@ -397,17 +435,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // --- view ---
 
-// layout computes pane widths and content height.
-// A pane's total on-screen width is its Width() + 2 (rounded border, no margin).
-// So leftW + rightW + 4 = m.width. Content height excludes the bottom bar (1)
-// and the pane's top/bottom border (2).
-func (m Model) layout() (leftW, rightW, contentHeight int) {
-	leftW = m.width*30/100 - 2
-	if leftW < 10 {
-		leftW = 10
+// layout computes the Width()/Height() values for each pane. The left pane is
+// borderless (total width == leftW). The right pane has a rounded border (+2 w,
+// +2 h) and Padding(1,2) (+4 w, +2 h), so its Width()/Height() are reduced to
+// keep both panes the same total size: leftW + rightW + 2 == m.width.
+//
+// rightContentW/rightContentH are the usable interior of the right pane (after
+// its padding) for sizing the timeline and viewport.
+func (m Model) layout() (leftW, leftH, rightW, rightH, rightContentW, rightContentH int) {
+	panesH := m.height - 1 // bottom bar
+	leftW = m.width * 30 / 100
+	if leftW < 14 {
+		leftW = 14
 	}
-	rightW = m.width - leftW - 4
-	contentHeight = m.height - 1 - 2
+	rightW = m.width - leftW - 2 // -2 for the right pane's border
+	if rightW < 1 {
+		rightW = 1
+	}
+	leftH = panesH
+	rightH = panesH - 4 // border (2) + vertical padding (2)
+	if rightH < 1 {
+		rightH = 1
+	}
+	rightContentW = rightW - 4 // horizontal padding (2 each side)
+	rightContentH = rightH
 	return
 }
 
@@ -416,23 +467,28 @@ func (m Model) View() string {
 		return ""
 	}
 
-	leftW, rightW, contentHeight := m.layout()
+	leftW, leftH, rightW, rightH, rightContentW, _ := m.layout()
 
 	left := m.styles.leftPane.
 		Width(leftW).
-		Height(contentHeight).
+		Height(leftH).
 		Render(m.renderList(leftW - 2)) // -2 for the pane's horizontal padding
 
 	right := m.styles.rightPane.
 		Width(rightW).
-		Height(contentHeight).
-		Render(m.renderDetail())
+		Height(rightH).
+		Render(m.renderDetail(rightContentW))
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	bar := m.styles.bar.Width(m.width).Render("↑↓ navigate · s/x/r start/stop/restart · tab panel · , settings · q quit")
 
 	view := lipgloss.JoinVertical(lipgloss.Left, panes, bar)
 
+	if m.showSwatches { // TEMP
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center, m.renderSwatches(),
+			lipgloss.WithWhitespaceChars(" "))
+	}
 	if m.showSettings {
 		return lipgloss.Place(m.width, m.height,
 			lipgloss.Center, lipgloss.Center,
@@ -475,7 +531,12 @@ func (m Model) renderList(inner int) string {
 // there are no SGR-reset holes across the fill (see bgIf).
 func (m Model) renderCard(i int, agent config.Agent, state launchd.AgentState, inner int) string {
 	selected := i == m.cursor
-	bg := m.styles.theme.Surface0
+	// Selected card background is a faint wash tinted by the agent's status
+	// (green running, red errored, neutral otherwise). Empty = no fill.
+	var bg lipgloss.Color
+	if selected {
+		bg = m.styles.statusSelBg(state.Status)
+	}
 
 	// line 1: icon + name
 	var iconSeg string
@@ -483,41 +544,58 @@ func (m Model) renderCard(i int, agent config.Agent, state launchd.AgentState, i
 		iconSeg = m.spinner.View()
 	} else {
 		ist := m.styles.statusIcon(state.Status, m.pulsePhase && m.settings.Animations)
-		iconSeg = bgIf(ist, selected, bg).Render(launchd.StatusIcon(state.Status))
+		iconSeg = withBG(ist, bg).Render(launchd.StatusIcon(state.Status))
 	}
-	nameStyle := m.styles.row
+	nameFg := m.styles.theme.Subtext0
 	if selected {
-		nameStyle = m.styles.selectedRow.Bold(true)
+		nameFg = m.styles.theme.Text
 	}
+	nameStyle := withBG(lipgloss.NewStyle().Foreground(nameFg).Bold(selected), bg)
 	name := ansi.Truncate(agent.DisplayName(), inner-4, "…")
-	line1 := m.bgSpace(1, selected) + iconSeg + m.bgSpace(2, selected) + bgIf(nameStyle, selected, bg).Render(name)
-	line1 = m.padTo(line1, inner, selected)
+	line1 := bgSpace(1, bg) + iconSeg + bgSpace(2, bg) + nameStyle.Render(name)
+	line1 = padTo(line1, inner, bg)
 
 	// line 2: status line
 	label, extra := statusLineText(state)
-	line2 := m.bgSpace(5, selected) + bgIf(m.styles.statusLabel(state.Status), selected, bg).Render(label)
+	line2 := bgSpace(5, bg) + withBG(m.styles.statusLabel(state.Status), bg).Render(label)
 	if extra != "" {
-		line2 += bgIf(m.styles.dim, selected, bg).Render(" · " + extra)
+		line2 += withBG(m.styles.dim, bg).Render(" · " + extra)
 	}
-	line2 = m.padTo(line2, inner, selected)
+	line2 = padTo(line2, inner, bg)
 
 	return line1 + "\n" + line2
 }
 
-// bgSpace returns n spaces, background-filled when selected.
-func (m Model) bgSpace(n int, selected bool) string {
-	s := strings.Repeat(" ", n)
-	if selected {
-		return lipgloss.NewStyle().Background(m.styles.theme.Surface0).Render(s)
+// placeholderBox centers a dim message in a w×h block, used to hold layout
+// space while content is still loading.
+func (m Model) placeholderBox(w, h int, msg string) string {
+	if h < 1 {
+		h = 1
 	}
-	return s
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, m.styles.dim.Render(msg))
 }
 
-// padTo right-pads a composed line to inner columns, filling with background
-// when selected.
-func (m Model) padTo(line string, inner int, selected bool) string {
+// withBG applies a background when bg is non-empty.
+func withBG(st lipgloss.Style, bg lipgloss.Color) lipgloss.Style {
+	if bg == "" {
+		return st
+	}
+	return st.Background(bg)
+}
+
+// bgSpace returns n spaces, filled with bg when bg is non-empty.
+func bgSpace(n int, bg lipgloss.Color) string {
+	s := strings.Repeat(" ", n)
+	if bg == "" {
+		return s
+	}
+	return lipgloss.NewStyle().Background(bg).Render(s)
+}
+
+// padTo right-pads a composed line to inner columns, filling with bg.
+func padTo(line string, inner int, bg lipgloss.Color) string {
 	if w := lipgloss.Width(line); w < inner {
-		return line + m.bgSpace(inner-w, selected)
+		return line + bgSpace(inner-w, bg)
 	}
 	return line
 }
@@ -538,9 +616,22 @@ func statusLineText(s launchd.AgentState) (label, extra string) {
 	}
 }
 
-func (m Model) renderDetail() string {
+func (m Model) renderDetail(contentW int) string {
 	if len(m.agents) == 0 || m.cursor >= len(m.agents) {
 		return "No agent selected."
+	}
+
+	// Activity timeline is always on top, regardless of the active tab. While the
+	// log is still loading we render an animated full-height placeholder (with
+	// the axis kept) so the layout holds its shape and nothing jumps.
+	var timeline string
+	switch {
+	case m.logContent != "":
+		timeline = m.styles.renderTimeline(m.logContent, contentW, timelineHeight)
+	case m.logPath == "":
+		timeline = m.placeholderBox(contentW, timelineHeight, "no activity")
+	default:
+		timeline = m.styles.renderLoadingTimeline(contentW, timelineHeight, m.loadFrame)
 	}
 
 	logsTab := m.styles.inactiveTab.Render("[L] Logs")
@@ -552,19 +643,21 @@ func (m Model) renderDetail() string {
 	}
 	tabBar := logsTab + "   " + infoTab
 
+	var body string
 	switch m.activeTab {
 	case tabLogs:
-		body := m.vp.View()
-		if m.logPath == "" {
-			body = m.styles.dim.Render("No log path configured in plist.")
-		} else if m.logContent == "" {
-			body = m.styles.dim.Render("(empty — waiting for output…)")
+		switch {
+		case m.logPath == "":
+			body = m.placeholderBox(contentW, m.vp.Height, "no log file for this agent")
+		case m.logContent == "":
+			body = m.placeholderBox(contentW, m.vp.Height, "loading logs…")
+		default:
+			scrollHint := ""
+			if !m.autoScroll {
+				scrollHint = m.styles.dim.Render("  [scroll mode — G to resume]") + "\n"
+			}
+			body = scrollHint + m.vp.View()
 		}
-		scrollHint := ""
-		if !m.autoScroll {
-			scrollHint = m.styles.dim.Render("  [scroll mode — G to resume]") + "\n"
-		}
-		return tabBar + "\n" + scrollHint + body
 
 	default: // tabInfo
 		agent := m.agents[m.cursor]
@@ -572,7 +665,6 @@ func (m Model) renderDetail() string {
 		if m.cursor < len(m.states) {
 			state = m.states[m.cursor]
 		}
-
 		rows := [][2]string{
 			{"Label", agent.Label},
 			{"Name", agent.DisplayName()},
@@ -582,14 +674,14 @@ func (m Model) renderDetail() string {
 			{"Run count", fmt.Sprintf("%d", state.RunCount)},
 			{"Plist", fmt.Sprintf("~/Library/LaunchAgents/%s.plist", agent.Label)},
 		}
-
 		var b strings.Builder
-		b.WriteString(tabBar + "\n\n")
 		for _, row := range rows {
 			b.WriteString(m.styles.infoLabel.Render(row[0]) + "  " + m.styles.infoValue.Render(row[1]) + "\n")
 		}
-		return strings.TrimRight(b.String(), "\n")
+		body = strings.TrimRight(b.String(), "\n")
 	}
+
+	return timeline + "\n\n\n" + tabBar + "\n\n\n" + body
 }
 
 func pidStr(pid int) string {
