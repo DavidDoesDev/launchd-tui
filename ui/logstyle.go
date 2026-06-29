@@ -104,6 +104,17 @@ func parseLogTime(line string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// lastTimestamp returns the most recent parseable timestamp in content.
+func lastTimestamp(content string) (time.Time, bool) {
+	lines := strings.Split(content, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t, ok := parseLogTime(lines[i]); ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // bucketFor maps a timestamp to a relative section. The live window (most
 // recent 5 min) gets no header — it's the stream you're watching. Older entries
 // split per calendar day with a date label.

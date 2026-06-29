@@ -76,6 +76,20 @@ type Model struct {
 	loadFrame      int  // animation frame for the loading placeholder
 	animating      bool // a loading-animation ticker is in flight
 	sparklePhase   int  // advances each sparkle tick to reshuffle the twinkle
+	schedules      []launchd.Schedule
+	lastLogTime    time.Time // most recent parsed timestamp in the current log
+}
+
+type schedulesMsg []launchd.Schedule
+
+func fetchSchedules(agents []config.Agent) tea.Cmd {
+	return func() tea.Msg {
+		out := make([]launchd.Schedule, len(agents))
+		for i, a := range agents {
+			out[i] = launchd.GetSchedule(a.Label)
+		}
+		return schedulesMsg(out)
+	}
 }
 
 type loadAnimMsg struct{}
@@ -119,7 +133,7 @@ func New() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{fetchAllStates(m.agents), pollCmd(m.pollDuration()), sparkleCmd()}
+	cmds := []tea.Cmd{fetchAllStates(m.agents), fetchSchedules(m.agents), pollCmd(m.pollDuration()), sparkleCmd()}
 	if m.settings.MouseWheel {
 		cmds = append(cmds, tea.EnableMouseCellMotion)
 	}
@@ -228,6 +242,7 @@ func (m *Model) startTail() tea.Cmd {
 	m.logPath = path
 	m.logOffset = 0
 	m.logContent = ""
+	m.lastLogTime = time.Time{}
 	m.autoScroll = true
 	m.vp.SetContent("")
 
@@ -263,6 +278,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case []launchd.AgentState:
 		m.states = msg
 
+	case schedulesMsg:
+		m.schedules = msg
+
 	case sparkleMsg:
 		m.sparklePhase++
 		cmds = append(cmds, sparkleCmd())
@@ -297,6 +315,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.content != "" {
 			m.logOffset += int64(len(msg.content))
 			m.logContent += msg.content
+			if t, ok := lastTimestamp(msg.content); ok {
+				m.lastLogTime = t
+			}
 			m.vp.SetContent(m.styles.styleLog(m.logContent, m.vp.Width))
 			if m.autoScroll {
 				m.vp.GotoBottom()
@@ -669,10 +690,16 @@ func (m Model) renderDetail(contentW int) string {
 		if m.cursor < len(m.states) {
 			state = m.states[m.cursor]
 		}
+		var sch launchd.Schedule
+		if m.cursor < len(m.schedules) {
+			sch = m.schedules[m.cursor]
+		}
 		rows := [][2]string{
 			{"Label", agent.Label},
 			{"Name", agent.DisplayName()},
 			{"Status", launchd.StatusLabel(state.Status)},
+			{"Schedule", sch.Describe()},
+			{"Next run", m.nextRun(sch)},
 			{"PID", pidStr(state.PID)},
 			{"Last exit", fmt.Sprintf("%d", state.ExitCode)},
 			{"Run count", fmt.Sprintf("%d", state.RunCount)},
@@ -686,6 +713,28 @@ func (m Model) renderDetail(contentW int) string {
 	}
 
 	return timeline + "\n\n\n" + tabBar + "\n\n\n" + body
+}
+
+// nextRun estimates the next launch for interval agents from the most recent
+// log timestamp + the interval. It's an estimate (log time ≈ launch time), so
+// it's marked with "~". Non-interval schedules return "—".
+func (m Model) nextRun(sch launchd.Schedule) string {
+	if sch.Interval <= 0 || m.lastLogTime.IsZero() {
+		return "—"
+	}
+	next := m.lastLogTime.Add(time.Duration(sch.Interval) * time.Second)
+	return "~" + humanizeRemaining(time.Until(next))
+}
+
+func humanizeRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "due"
+	}
+	s := int(d.Seconds() + 0.5)
+	if s >= 60 {
+		return fmt.Sprintf("in %dm %02ds", s/60, s%60)
+	}
+	return fmt.Sprintf("in %ds", s)
 }
 
 func pidStr(pid int) string {

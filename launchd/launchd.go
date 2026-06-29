@@ -122,6 +122,116 @@ func StatusLabel(s Status) string {
 	}
 }
 
+// Schedule describes how/when an agent is launched, parsed from its plist.
+type Schedule struct {
+	Interval  int    // StartInterval seconds, 0 if none
+	Calendar  string // human description of StartCalendarInterval, "" if none
+	KeepAlive bool
+	RunAtLoad bool
+}
+
+func GetSchedule(label string) Schedule {
+	var sch Schedule
+	plistPath := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", label+".plist")
+	out, err := exec.Command("plutil", "-convert", "json", "-o", "-", plistPath).Output()
+	if err != nil {
+		return sch
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(out, &data); err != nil {
+		return sch
+	}
+	if v, ok := data["StartInterval"].(float64); ok {
+		sch.Interval = int(v)
+	}
+	if v, ok := data["RunAtLoad"].(bool); ok {
+		sch.RunAtLoad = v
+	}
+	switch data["KeepAlive"].(type) {
+	case bool:
+		sch.KeepAlive = data["KeepAlive"].(bool)
+	case map[string]interface{}:
+		sch.KeepAlive = true // conditional keep-alive still means daemon-ish
+	}
+	if v, ok := data["StartCalendarInterval"]; ok {
+		sch.Calendar = describeCalendar(v)
+	}
+	return sch
+}
+
+// Describe gives the agent's cadence in a short human form.
+func (s Schedule) Describe() string {
+	switch {
+	case s.Interval > 0:
+		return "every " + humanizeInterval(s.Interval)
+	case s.Calendar != "":
+		return s.Calendar
+	case s.KeepAlive:
+		return "kept alive"
+	case s.RunAtLoad:
+		return "at load"
+	default:
+		return "manual"
+	}
+}
+
+func humanizeInterval(sec int) string {
+	switch {
+	case sec%3600 == 0:
+		return fmt.Sprintf("%dh", sec/3600)
+	case sec%60 == 0:
+		return fmt.Sprintf("%dm", sec/60)
+	default:
+		return fmt.Sprintf("%ds", sec)
+	}
+}
+
+func describeCalendar(v interface{}) string {
+	switch cv := v.(type) {
+	case map[string]interface{}:
+		return describeCalDict(cv)
+	case []interface{}:
+		if len(cv) == 1 {
+			if m, ok := cv[0].(map[string]interface{}); ok {
+				return describeCalDict(m)
+			}
+		}
+		return fmt.Sprintf("%d×/day", len(cv))
+	}
+	return "calendar"
+}
+
+func describeCalDict(m map[string]interface{}) string {
+	get := func(k string) (int, bool) {
+		if f, ok := m[k].(float64); ok {
+			return int(f), true
+		}
+		return 0, false
+	}
+	hour, hOK := get("Hour")
+	min, mOK := get("Minute")
+	wd, wOK := get("Weekday")
+	clock := ""
+	if hOK || mOK {
+		clock = fmt.Sprintf("%02d:%02d", hour, min)
+	}
+	switch {
+	case wOK && clock != "":
+		return weekdayName(wd) + " " + clock
+	case clock != "":
+		return "daily " + clock
+	case wOK:
+		return weekdayName(wd)
+	default:
+		return "calendar"
+	}
+}
+
+func weekdayName(d int) string {
+	names := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	return names[((d%7)+7)%7] // launchd treats 0 and 7 as Sunday
+}
+
 func Start(label string) error {
 	return runLaunchctl("start", label)
 }
