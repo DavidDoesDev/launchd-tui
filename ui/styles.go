@@ -16,14 +16,9 @@ func blend(a, b lipgloss.Color, t float64) lipgloss.Color {
 	return lipgloss.Color(ca.BlendRgb(cb, t).Hex())
 }
 
-// desaturate scales a color's saturation toward grey (factor 0 = fully grey).
-func desaturate(c lipgloss.Color, factor float64) lipgloss.Color {
-	cc, err := colorful.Hex(string(c))
-	if err != nil {
-		return c
-	}
-	h, s, l := cc.Hsl()
-	return lipgloss.Color(colorful.Hsl(h, s*factor, l).Hex())
+// lighten mixes a color toward white by amt.
+func lighten(c lipgloss.Color, amt float64) lipgloss.Color {
+	return blend(c, lipgloss.Color("#ffffff"), amt)
 }
 
 // Styles holds every lipgloss.Style the UI renders with, derived from a Theme.
@@ -31,20 +26,18 @@ func desaturate(c lipgloss.Color, factor float64) lipgloss.Color {
 // reads m.styles.X instead of package-level globals — themes become swappable
 // at runtime.
 type Styles struct {
-	theme Theme
-	selBg lipgloss.Color // subtle selection background
+	theme   Theme
+	selText lipgloss.Color // whiter text for the selected card name
 
-	leftPane    lipgloss.Style
-	rightPane   lipgloss.Style
-	bar         lipgloss.Style
-	row         lipgloss.Style
-	selectedRow lipgloss.Style
+	leftPane  lipgloss.Style
+	rightPane lipgloss.Style
+	bar       lipgloss.Style
+	row       lipgloss.Style
 
-	iconRunning    lipgloss.Style
-	iconRunningDim lipgloss.Style
-	iconStopped    lipgloss.Style
-	iconErrored    lipgloss.Style
-	iconUnknown    lipgloss.Style
+	iconRunning lipgloss.Style
+	iconStopped lipgloss.Style
+	iconErrored lipgloss.Style
+	iconUnknown lipgloss.Style
 
 	spinner     lipgloss.Style
 	activeTab   lipgloss.Style
@@ -75,10 +68,9 @@ type Styles struct {
 }
 
 func newStyles(t Theme) Styles {
-	selBg := desaturate(blend(t.Base, t.Surface0, 0.5), 0.4)
 	return Styles{
-		theme: t,
-		selBg: selBg,
+		theme:   t,
+		selText: lighten(t.Text, 0.45),
 
 		leftPane: lipgloss.NewStyle().Padding(0, 1),
 		rightPane: lipgloss.NewStyle().
@@ -86,14 +78,12 @@ func newStyles(t Theme) Styles {
 			Padding(1, 2), // ~2× the usual pane padding
 		bar: lipgloss.NewStyle().
 			Background(t.Mantle).Foreground(t.Overlay0).Padding(0, 1),
-		row:         lipgloss.NewStyle().Foreground(t.Subtext0),
-		selectedRow: lipgloss.NewStyle().Foreground(t.Text).Background(selBg),
+		row: lipgloss.NewStyle().Foreground(t.Subtext0),
 
-		iconRunning:    lipgloss.NewStyle().Foreground(t.Green),
-		iconRunningDim: lipgloss.NewStyle().Foreground(t.GreenDim),
-		iconStopped:    lipgloss.NewStyle().Foreground(t.Overlay0),
-		iconErrored:    lipgloss.NewStyle().Foreground(t.Red),
-		iconUnknown:    lipgloss.NewStyle().Foreground(t.Surface1),
+		iconRunning: lipgloss.NewStyle().Foreground(t.Green),
+		iconStopped: lipgloss.NewStyle().Foreground(t.Overlay0),
+		iconErrored: lipgloss.NewStyle().Foreground(t.Red),
+		iconUnknown: lipgloss.NewStyle().Foreground(t.Surface1),
 
 		spinner:     lipgloss.NewStyle().Foreground(t.Yellow),
 		activeTab:   lipgloss.NewStyle().Foreground(t.Blue).Bold(true).Underline(true),
@@ -118,7 +108,7 @@ func newStyles(t Theme) Styles {
 
 		modal: lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).BorderForeground(t.Mauve).
-			Background(t.Base).Padding(1, 2),
+			Padding(1, 2), // transparent interior to match the (borderless) app bg
 		modalTitle: lipgloss.NewStyle().Foreground(t.Mauve).Bold(true),
 		modalRow:   lipgloss.NewStyle().Foreground(t.Subtext0),
 		modalRowOn: lipgloss.NewStyle().Foreground(t.Text).Bold(true),
@@ -126,12 +116,9 @@ func newStyles(t Theme) Styles {
 	}
 }
 
-func (s Styles) statusIcon(status launchd.Status, pulse bool) lipgloss.Style {
+func (s Styles) statusIcon(status launchd.Status) lipgloss.Style {
 	switch status {
 	case launchd.StatusRunning:
-		if pulse {
-			return s.iconRunningDim
-		}
 		return s.iconRunning
 	case launchd.StatusStopped:
 		return s.iconStopped
@@ -140,27 +127,6 @@ func (s Styles) statusIcon(status launchd.Status, pulse bool) lipgloss.Style {
 	default:
 		return s.iconUnknown
 	}
-}
-
-// statusSelBg returns the selected-card background: a faint, slightly
-// desaturated wash of the status color over the base, so the highlight subtly
-// echoes the agent's state.
-func (s Styles) statusSelBg(status launchd.Status) lipgloss.Color {
-	var c lipgloss.Color
-	switch status {
-	case launchd.StatusRunning:
-		c = s.theme.Green
-	case launchd.StatusErrored:
-		c = s.theme.Red
-	case launchd.StatusStopped:
-		c = s.theme.Subtext0
-	default:
-		c = s.theme.Overlay0
-	}
-	// Lift the base most of the way to surface0 — a solid, clearly-present
-	// surface — then wash a subtle status tint over it.
-	surface := blend(s.theme.Base, s.theme.Surface0, 0.9)
-	return blend(surface, c, 0.16)
 }
 
 func (s Styles) statusLabel(status launchd.Status) lipgloss.Style {
@@ -174,14 +140,4 @@ func (s Styles) statusLabel(status launchd.Status) lipgloss.Style {
 	default:
 		return s.statusUnknown
 	}
-}
-
-// bgIf returns the style with a background applied when on (used to fill a
-// selected card's full width without the SGR-reset holes that a single outer
-// Render would leave over inner-colored segments).
-func bgIf(st lipgloss.Style, on bool, c lipgloss.Color) lipgloss.Style {
-	if on {
-		return st.Background(c)
-	}
-	return st
 }

@@ -18,7 +18,6 @@ import (
 
 const pollInterval = 2 * time.Second
 const logTailInterval = 500 * time.Millisecond
-const pulseInterval = 800 * time.Millisecond
 const timelineHeight = 10 // activity chart rows atop the log view (incl. 2-row axis)
 
 const (
@@ -34,8 +33,6 @@ type tailMsg struct {
 	content    string
 	generation int
 }
-
-type pulseMsg struct{}
 
 type actionDoneMsg struct {
 	idx        int
@@ -65,7 +62,6 @@ type Model struct {
 	spinner        spinner.Model
 	actionIdx      int
 	actionDeadline time.Time
-	pulsePhase     bool
 	vp             viewport.Model
 	logContent     string
 	autoScroll     bool
@@ -76,17 +72,24 @@ type Model struct {
 	settings       config.Settings
 	showSettings   bool
 	settingsCursor int
-	showSwatches   bool // TEMP: swatch picker
+	showSwatches   bool // TEMP: swatch reference
 	loadFrame      int  // animation frame for the loading placeholder
 	animating      bool // a loading-animation ticker is in flight
+	sparklePhase   int  // advances each sparkle tick to reshuffle the twinkle
 }
 
 type loadAnimMsg struct{}
+type sparkleMsg struct{}
 
 const loadAnimInterval = 90 * time.Millisecond
+const sparkleInterval = 130 * time.Millisecond
 
 func loadAnimCmd() tea.Cmd {
 	return tea.Tick(loadAnimInterval, func(time.Time) tea.Msg { return loadAnimMsg{} })
+}
+
+func sparkleCmd() tea.Cmd {
+	return tea.Tick(sparkleInterval, func(time.Time) tea.Msg { return sparkleMsg{} })
 }
 
 func New() Model {
@@ -116,7 +119,7 @@ func New() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{fetchAllStates(m.agents), pollCmd(m.pollDuration()), pulseCmd()}
+	cmds := []tea.Cmd{fetchAllStates(m.agents), pollCmd(m.pollDuration()), sparkleCmd()}
 	if m.settings.MouseWheel {
 		cmds = append(cmds, tea.EnableMouseCellMotion)
 	}
@@ -128,10 +131,6 @@ func (m Model) pollDuration() time.Duration {
 		return time.Duration(m.settings.PollIntervalSec) * time.Second
 	}
 	return pollInterval
-}
-
-func pulseCmd() tea.Cmd {
-	return tea.Tick(pulseInterval, func(time.Time) tea.Msg { return pulseMsg{} })
 }
 
 // --- commands ---
@@ -264,9 +263,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case []launchd.AgentState:
 		m.states = msg
 
-	case pulseMsg:
-		m.pulsePhase = !m.pulsePhase
-		cmds = append(cmds, pulseCmd())
+	case sparkleMsg:
+		m.sparklePhase++
+		cmds = append(cmds, sparkleCmd())
 
 	case loadAnimMsg:
 		// Advance the loading wave only while still loading; otherwise let the
@@ -342,7 +341,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showSettings = true
 			return m, nil
 
-		case "0": // TEMP: toggle swatch picker
+		case "0": // TEMP: toggle swatch reference
 			m.showSwatches = !m.showSwatches
 			return m, nil
 
@@ -520,59 +519,53 @@ func (m Model) renderList(inner int) string {
 		}
 		cards[i] = m.renderCard(i, agent, state, inner)
 	}
-	// Blank spacer line between cards (left unfilled, herdr-style).
+	// Blank spacer line between cards.
 	return "\n" + strings.Join(cards, "\n\n")
 }
 
 // renderCard draws one agent as a two-line card: line 1 is the status icon +
 // name, line 2 an indented status line (state + pid/exit). The selected card
-// fills its full width with the surface background. Every visible segment —
-// including gaps and trailing pad — carries the background when selected, so
-// there are no SGR-reset holes across the fill (see bgIf).
+// fills with the herdr surface0 background and carries a fat left bar in the
+// agent's status color; unselected cards reserve the same column with a blank.
+// Every segment carries the background when selected so the fill has no
+// SGR-reset holes.
 func (m Model) renderCard(i int, agent config.Agent, state launchd.AgentState, inner int) string {
 	selected := i == m.cursor
-	// Selected card background is a faint wash tinted by the agent's status
-	// (green running, red errored, neutral otherwise). Empty = no fill.
 	var bg lipgloss.Color
 	if selected {
-		bg = m.styles.statusSelBg(state.Status)
+		bg = m.styles.theme.Surface0 // herdr selected-tab navy
 	}
 
-	// line 1: icon + name
+	// Fat left bar (neutral) on the fill, or a blank reserving the column.
+	barSeg := " "
+	if selected {
+		barSeg = lipgloss.NewStyle().Foreground(m.styles.theme.Subtext0).Background(bg).Render("▌")
+	}
+
 	var iconSeg string
 	if i == m.actionIdx {
 		iconSeg = m.spinner.View()
 	} else {
-		ist := m.styles.statusIcon(state.Status, m.pulsePhase && m.settings.Animations)
-		iconSeg = withBG(ist, bg).Render(launchd.StatusIcon(state.Status))
+		iconSeg = withBG(m.styles.statusIcon(state.Status), bg).Render(launchd.StatusIcon(state.Status))
 	}
 	nameFg := m.styles.theme.Subtext0
 	if selected {
-		nameFg = m.styles.theme.Text
+		nameFg = m.styles.selText
 	}
 	nameStyle := withBG(lipgloss.NewStyle().Foreground(nameFg).Bold(selected), bg)
-	name := ansi.Truncate(agent.DisplayName(), inner-4, "…")
-	line1 := bgSpace(1, bg) + iconSeg + bgSpace(2, bg) + nameStyle.Render(name)
+	name := ansi.Truncate(agent.DisplayName(), inner-5, "…") // bar+gap+icon+gutter = 5
+
+	line1 := barSeg + bgSpace(1, bg) + iconSeg + bgSpace(2, bg) + nameStyle.Render(name)
 	line1 = padTo(line1, inner, bg)
 
-	// line 2: status line
 	label, extra := statusLineText(state)
-	line2 := bgSpace(5, bg) + withBG(m.styles.statusLabel(state.Status), bg).Render(label)
+	line2 := barSeg + bgSpace(4, bg) + withBG(m.styles.statusLabel(state.Status), bg).Render(label)
 	if extra != "" {
 		line2 += withBG(m.styles.dim, bg).Render(" · " + extra)
 	}
 	line2 = padTo(line2, inner, bg)
 
 	return line1 + "\n" + line2
-}
-
-// placeholderBox centers a dim message in a w×h block, used to hold layout
-// space while content is still loading.
-func (m Model) placeholderBox(w, h int, msg string) string {
-	if h < 1 {
-		h = 1
-	}
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, m.styles.dim.Render(msg))
 }
 
 // withBG applies a background when bg is non-empty.
@@ -592,12 +585,21 @@ func bgSpace(n int, bg lipgloss.Color) string {
 	return lipgloss.NewStyle().Background(bg).Render(s)
 }
 
-// padTo right-pads a composed line to inner columns, filling with bg.
+// padTo right-pads an ANSI-containing line to inner columns, filling with bg.
 func padTo(line string, inner int, bg lipgloss.Color) string {
 	if w := lipgloss.Width(line); w < inner {
 		return line + bgSpace(inner-w, bg)
 	}
 	return line
+}
+
+// placeholderBox centers a dim message in a w×h block, used to hold layout
+// space while content is still loading.
+func (m Model) placeholderBox(w, h int, msg string) string {
+	if h < 1 {
+		h = 1
+	}
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, m.styles.dim.Render(msg))
 }
 
 // statusLineText returns the card's second-line label and optional detail.
@@ -627,7 +629,7 @@ func (m Model) renderDetail(contentW int) string {
 	var timeline string
 	switch {
 	case m.logContent != "":
-		timeline = m.styles.renderTimeline(m.logContent, contentW, timelineHeight)
+		timeline = m.styles.renderTimeline(m.logContent, contentW, timelineHeight, m.sparklePhase, m.settings.Animations)
 	case m.logPath == "":
 		timeline = m.placeholderBox(contentW, timelineHeight, "no activity")
 	default:

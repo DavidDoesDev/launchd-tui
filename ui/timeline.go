@@ -69,28 +69,56 @@ func buildBuckets(content string, cols int) (buckets []tlBucket, start, end time
 	return buckets, start, end, true
 }
 
-func (s Styles) tlSeverity(sev int) lipgloss.Style {
+func (s Styles) tlSeverityColor(sev int) lipgloss.Color {
 	switch sev {
 	case 2:
-		return s.logError
+		return s.theme.Red
 	case 1:
-		return s.logWarn
+		return s.theme.Yellow
 	default:
-		return s.logSuccess
+		return s.theme.Green
 	}
 }
 
-// renderTimeline draws a single full-width Braille area chart `height` rows
-// tall: dot height = log volume, cell color = worst severity in that time slice,
-// with a thin labelled time axis on the bottom row.
-func (s Styles) renderTimeline(content string, width, height int) string {
+// cellHash avalanches a cell coordinate into a well-mixed value so neighbors
+// don't correlate.
+func cellHash(r, c int) uint64 {
+	h := uint64(uint32(r))*0x100000001b3 + 0xcbf29ce484222325
+	h = (h ^ uint64(uint32(c))) * 0x100000001b3
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
+}
+
+// sparkleLift returns how much to brighten a cell this frame (0 = none). Each
+// cell gets its own phase offset from cellHash, so dots twinkle in and out on
+// staggered schedules — no synchronized cohorts — and fade via a triangular
+// ramp rather than flashing on/off.
+func sparkleLift(r, c, frame int) float64 {
+	const cycle, window = 50, 7
+	off := int(cellHash(r, c) % cycle)
+	phase := (frame + off) % cycle
+	if phase >= window {
+		return 0
+	}
+	d := float64(phase) / float64(window-1) // 0..1 across the window
+	return 0.55 * (1 - math.Abs(2*d-1))     // peak in the middle, fade either side
+}
+
+// renderTimeline draws a single full-width dot-matrix activity chart `height`
+// rows tall: each column is a bucket, its bar a stack of ● dots scaled by log
+// volume, colored by the worst severity in that time slice. One dot per cell
+// means each point is independently colorable — so the sparkle can twinkle
+// individual dots rather than whole clusters.
+func (s Styles) renderTimeline(content string, width, height, frame int, sparkle bool) string {
 	if width < 4 || height < 2 {
 		return ""
 	}
-	chartH := height - 2  // bottom two rows are the tick + label axis
-	dotCols := width * 2  // 2 dot-columns per cell
-	dotRows := chartH * 4 // 4 dot-rows per cell
-	buckets, start, end, ok := buildBuckets(content, dotCols)
+	chartH := height - 2 // bottom two rows are the tick + label axis
+	buckets, start, end, ok := buildBuckets(content, width)
 	if !ok {
 		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center,
 			s.dim.Render("no activity timeline — logs lack dated timestamps"))
@@ -103,33 +131,25 @@ func (s Styles) renderTimeline(content string, width, height int) string {
 		}
 	}
 
-	// Accumulate dot bits per cell and track each cell's severity.
-	bits := make([][]uint8, chartH)
-	for r := range bits {
-		bits[r] = make([]uint8, width)
-	}
-	colSev := make([]int, width)
-	for x, b := range buckets {
-		cellX, dx := x/2, x%2
-		if b.sev > colSev[cellX] {
-			colSev[cellX] = b.sev
-		}
-		h := int(float64(b.count)/float64(maxCount)*float64(dotRows) + 0.5)
-		for d := 0; d < h; d++ { // d counts dot-rows up from the bottom
-			row := chartH - 1 - d/4
-			dotY := 3 - d%4
-			bits[row][cellX] |= brailleDots[dx][dotY]
-		}
-	}
-
 	var sb strings.Builder
 	for r := 0; r < chartH; r++ {
 		for c := 0; c < width; c++ {
-			if bits[r][c] == 0 {
-				sb.WriteByte(' ')
-			} else {
-				sb.WriteString(s.tlSeverity(colSev[c]).Render(string(rune(0x2800 + int(bits[r][c])))))
+			b := buckets[c]
+			h := int(float64(b.count)/float64(maxCount)*float64(chartH) + 0.5)
+			if b.count > 0 && h == 0 {
+				h = 1 // always show at least one dot where there's any activity
 			}
+			if chartH-1-r >= h { // above the bar top
+				sb.WriteByte(' ')
+				continue
+			}
+			col := s.tlSeverityColor(b.sev)
+			if sparkle {
+				if lift := sparkleLift(r, c, frame); lift > 0 {
+					col = lighten(col, lift)
+				}
+			}
+			sb.WriteString(lipgloss.NewStyle().Foreground(col).Render("⣿"))
 		}
 		sb.WriteByte('\n')
 	}
