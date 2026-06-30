@@ -170,22 +170,54 @@ func (s Styles) renderDivider(label string, width int) string {
 // bucket changes (except entering the live window). Lines without a parseable
 // date inherit the running bucket, so dividers only appear where they're
 // meaningful — a date-less log (e.g. time-only timestamps) gets none.
+//
+// It also decides, from the log's own shape, whether to blank-separate events:
+// when entries tend to be multi-line (many continuation lines per timestamp),
+// a blank line before each new event makes the log read as discrete blocks.
+// When entries are mostly single-line, that would just bloat it, so it stays
+// dense.
 func (s Styles) styleLog(content string, width int) string {
 	now := time.Now()
 	lines := strings.Split(content, "\n")
+	group := shouldGroupEvents(lines)
+
 	out := make([]string, 0, len(lines))
 	bucket := ""
+	dividedAt := -1 // index of the last line we emitted a divider before
 	for _, line := range lines {
+		isTS := false
 		if t, ok := parseLogTime(line); ok {
+			isTS = true
 			if id, label, live := bucketFor(t, now); id != bucket {
 				bucket = id
 				if !live {
-					// A full blank line on each side of the header.
 					out = append(out, "", s.renderDivider(label, width), "")
+					dividedAt = len(out)
 				}
 			}
+		}
+		// Blank-separate events (a new timestamped line) when grouping, unless a
+		// divider already provided the spacing.
+		if group && isTS && len(out) > 0 && len(out) != dividedAt {
+			out = append(out, "")
 		}
 		out = append(out, s.styleLogLine(line))
 	}
 	return strings.Join(out, "\n")
+}
+
+// shouldGroupEvents returns true when entries average enough lines (timestamped
+// line + its continuation lines) that blank-separating events aids readability.
+func shouldGroupEvents(lines []string) bool {
+	var nonEmpty, timestamped int
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		nonEmpty++
+		if _, ok := parseLogTime(l); ok {
+			timestamped++
+		}
+	}
+	return timestamped > 0 && float64(nonEmpty)/float64(timestamped) >= 1.5
 }

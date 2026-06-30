@@ -474,7 +474,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // rightContentW/rightContentH are the usable interior of the right pane (after
 // its padding) for sizing the timeline and viewport.
 func (m Model) layout() (leftW, leftH, rightW, rightH, rightContentW, rightContentH int) {
-	panesH := m.height - 1 // bottom bar
+	panesH := m.height - 2 // bottom bar (1) + a blank-line margin above it (1)
 	leftW = m.width * 30 / 100
 	if leftW < 14 {
 		leftW = 14
@@ -513,7 +513,7 @@ func (m Model) View() string {
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	bar := m.styles.bar.Width(m.width).Render("↑↓ navigate · s/x/r start/stop/restart · tab panel · , settings · ? help · q quit")
 
-	view := lipgloss.JoinVertical(lipgloss.Left, panes, bar)
+	view := lipgloss.JoinVertical(lipgloss.Left, panes, "", bar) // blank-line margin above the bar
 
 	if m.showHelp {
 		return lipgloss.Place(m.width, m.height,
